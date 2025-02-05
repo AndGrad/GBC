@@ -12,7 +12,7 @@
 pacman::p_load(tidyverse, gghalves, here, lmerTest, ggthemes, cowplot, ggh4x, grid)
 
 ## load data
-all_data <- read_csv(file = paste0(here(), "/data/social/data_social_all_participants_08-2024.csv"))
+all_data <- read_csv(file = paste0(here(), "/data/data_social_all_participants_08-2024.csv"))
 
 labels_a <- c(
   `worst` = "Low quality 
@@ -218,30 +218,7 @@ b <-
  upper
  
  
- get_legend( 
-   upper 
- ) 
- 
- 
- legend <- get_legend( 
-   upper + 
-     guides(
-       color = FALSE,
-       shape = FALSE,
-       #fill = FALSE,
-       fill = guide_legend(override.aes = list(
-         #alpha = .5,
-         shape = 21,
-         #size  = 2,
-         fill = c("#e41a1c", "#377eb8", "#4daf4a")
-       )),
-       #label = FALSE,
-       #   fill = FALSE,
-       #    shape = FALSE
-     ) +
-   theme(legend.position = "right") 
- ) 
- 
+
  # Combine combined plot and legend using plot_grid() 
  plot_grid(upper, legend,ncol=2,rel_widths = c(1, .4))
  upper
@@ -386,5 +363,5 @@ figure2 <-
 figure2
 
 ## save figure
-ggsave("plots/figure2.png", figure2, height = 6, width = 10, scale = 1)
+ggsave("figures/figure2.png", figure2, height = 6, width = 10, scale = 1)
 
