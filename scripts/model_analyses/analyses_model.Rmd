@@ -1,0 +1,917 @@
+---
+title: "Modelfitting"
+author: "Simon&Andrea"
+date: '2022-10-120'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+pacman::p_load(brms,tidyverse, rjson, DEoptim, doParallel, here,data.table,jsonlite,lme4, ggthemes, cowplot,gghalves, runner)
+options(buildtools.check = function(action) TRUE)
+here::i_am("./scripts/model_analyses/analyses_model.Rmd")
+knitr::opts_knit$set(root.dir = here()) # set root fot the whole file
+
+priors_bf <- c(
+  prior_string("normal(0, 0.1)", class = "b")
+)
+```
+
+In this document, we will fit learning model to the "social bandit" task that Andrea and I developed. 
+First, lets load some data.
+
+
+
+```{r}
+
+random_G2s <-  -1 * (log((1 / 64)) * 24 * 4)
+
+source(here("scripts","model_analyses","load_environments_social_experiment.R")) # environments
+source(here("scripts","model_analyses","sim_models.R")) # modelcode for simulation
+
+#environment files are in generated files
+social_sims_plot_d <- list()
+
+environment_lookup<-environments%>%group_split(env)
+
+social_data <-  read_csv(file = here("data","data_social_all_participants_08-2024.csv"))
+
+social_data%>%
+  ggplot(aes(x=p_value_rand,color=p_value_rand<0.05))+
+  geom_histogram()
+
+
+
+```
+
+
+
+```{r}
+
+## load behavioral data
+#social_data <-  read_csv(file = here("data","social","data_social_all_participants.csv"))
+
+# total max min for range normalization
+max_gem<-social_data%>%filter(gempresent==1)%>%pull(points)%>%max()
+max_no_gem<-social_data%>%filter(gempresent==0)%>%pull(points)%>%max()
+min<-social_data%>%pull(points)%>%min()
+
+social_data<-social_data%>%
+  group_by(round,uniqueID,group)%>%
+  mutate(often=abs(social_info-lag(social_info)))%>%
+  mutate(change=ifelse(often==0,0,1))%>%
+  mutate(streak=streak_run(change))%>%
+  mutate(streak=ifelse(change==1,1,streak))%>%
+  mutate(streak=ifelse(is.na(streak),1,streak))%>%
+  mutate(streak=streak/25)%>%
+  mutate(qual=case_when(
+    demo_quality=="worst"~1,
+    demo_quality=="medium"~2,
+    demo_quality=="best"~3
+  )
+  )
+```
+
+
+# Fit model to social data
+This function fits the model specified in models_mle and stores the parameter estimates as well as the fit index (lower is better)
+alongside the participant data in long format. In the future we want to modify this to fit different models
+
+```{r}
+
+fitagain=T
+# 
+cl <- makeCluster(detectCores()-8, type = 'PSOCK')
+registerDoParallel(cl)
+#opts <- list(chunkSize=2)
+
+## loads the script where the learning models are specified (Q-learning, social Q-learning, UCB etc)
+source(here("scripts","model_analyses","learning_models.R"))
+
+## load functions that perform Maximul Likelihood Estimation
+source(here("scripts","model_analyses","models_mle_2.R"))
+
+## load functions that initialize the model fit
+source(here("scripts","model_analyses","model_fitting_functions_social_bandits_2.R"))
+
+if (fitagain){
+  social_fits <- foreach(
+    player_nr = unique(social_data$uniqueID),
+    .packages = c("DEoptim", "tidyverse","here","data.table"),
+    .combine = "rbind"
+  ) %dopar%{
+    environments <- load_envs_social(path = here("scripts","model_analyses","environments"))
+    
+    Xnew <- as.matrix(expand.grid(0:7, 0:7)) # do this outside the loop for better speed
+    d1 <- social_data %>% 
+      filter(uniqueID == player_nr) %>%
+      mutate(z =points,
+             choices = choice
+      )%>%ungroup()
+    
+    cv <- tryCatch(        # might throw an error, just continue if it does and dont be annoying
+      {
+        fit_policy(d1=d1)
+      },
+      warning = function(w) {
+        # Handle warnings
+        message("Warning occurred: ", conditionMessage(w))
+        fit_policy(d1=d1)
+      },
+      error = function(e) {
+        # Handle errors
+        message("Error occurred: ", conditionMessage(e))
+        return(NA)  # Return a default value
+      }
+    )
+    
+    print(cv)
+    # collect fit indices
+    
+    d1$fit <- unlist(cv[1])# is always the fit index
+    d1$p1<-unlist(cv[2])
+    d1$p2<-unlist(cv[3])#low
+    d1$p3<-unlist(cv[4])#medium
+    d1$p4<-unlist(cv[5])#high
+    
+    return(d1)
+    
+  }
+  
+  saveRDS(social_fits,file = here("scripts","model_analyses","derivatives","fits_policy_shaping.rds"))
+}else{
+  social_fits<-readRDS(file = here("scripts","model_analyses","derivatives","fits_policy_shaping.rds"))%>%ungroup()
+}
+
+```
+
+
+```{r}
+plot_df<-social_fits %>%#filter(sw_1>0)%>%
+  dplyr::select(uniqueID, group,"p1","p2","p3","p4")%>%unique()%>%
+  pivot_longer(c("p1","p2","p3","p4"))%>%
+  # filter(value>0.001 & value <900)%>%
+  mutate(var_greek=case_when(
+    name=="p1"~"alpha",
+    name=="p2"~"tau",
+    name=="p3"~"omega",
+    name=="p4"~"zeta"
+  )
+  )
+
+
+# Define the expressions for the labels
+labels <- c(
+  p1 = "atop('Learning rate', alpha)",
+  p2 = "atop('Temperature', tau)",
+  p3 = "atop('Social learning rate', omega)",
+  p4 = "atop('Prior copy probability', italic(softmax)(zeta))"
+)
+
+# Recode the 'name' column to match the expressions
+plot_df$name <- recode(plot_df$name,
+                       p1 = labels["p1"],
+                       p2 = labels["p2"],
+                       p3 = labels["p3"],
+                       p4 = labels["p4"]
+)
+
+# Convert the 'name' column to a factor with the desired order
+plot_df$name <- factor(plot_df$name, levels = labels)
+
+parameters <- plot_df %>%
+  mutate(value = ifelse(name == labels["p4"], 1 / (1 + exp(2.5 / value)), value)) %>%
+  ggplot(aes(x = group, y = value, color = group)) +
+  theme_bw(14) +
+  stat_boxplot() +
+  geom_point(size = 0.3, shape = 5) +
+  scale_color_brewer(name = "", palette = "Set2") +
+  scale_x_discrete(name = "Agegroup") +
+  scale_y_continuous(name = "Parameter value") +
+  facet_wrap(. ~ name, scales = "free_y", labeller = label_parsed, nrow = 2) +
+  theme(aspect.ratio = 1)
+```
+
+# group differences in parameter
+
+```{r}
+
+mod_lr<-plot_df%>%filter(var_greek=="alpha")%>%brms::brm(value~group,prior = priors_bf,sample_prior = T,data=.)
+mod_temp<-plot_df%>%filter(var_greek=="tau")%>%brms::brm(value~group,prior = priors_bf,sample_prior = T,data=.)
+mod_soclr<-plot_df%>%filter(var_greek=="omega")%>%brms::brm(value~group,prior = priors_bf,sample_prior = T,data=.)
+mod_priocp<-plot_df%>%filter(var_greek=="zeta")%>%brms::brm(value~group,prior = priors_bf,sample_prior = T,data=.)
+
+
+post_lr<-bayestestR::describe_posterior(mod_lr)
+post_temp<-bayestestR::describe_posterior(mod_temp)
+post_soclr<-bayestestR::describe_posterior(mod_soclr)
+post_cp<-bayestestR::describe_posterior(mod_priocp)
+
+bf_lr<-bayestestR::bayesfactor_parameters(mod_lr)
+bf_temp<-bayestestR::bayesfactor_parameters(mod_temp)
+bf_soclr<-bayestestR::bayesfactor_parameters(mod_soclr)
+bf_cp<-bayestestR::bayesfactor_parameters(mod_priocp)
+
+```
+
+#"Posterior" sims
+Simulating choices from the policy model
+```{r}
+
+simagain=F
+if (simagain){
+  cl <- makeCluster(detectCores()-8, type = 'PSOCK')
+  registerDoParallel(cl)
+  
+  for (rptx in 1:20){
+    social_sims_plot_d[[rptx]]<-foreach(
+      player_nr = unique(social_fits$uniqueID),
+      .packages = c("DEoptim", "dplyr","here"),
+      .combine = "rbind"
+    ) %dopar%{
+      print(player_nr)
+      # social data TODO: concatenate nonsocial data.
+      dat <- social_fits %>% filter(
+        uniqueID == player_nr,
+      ) 
+      
+      estimates <- c(
+        unique(dat$p1),
+        unique(dat$p2),
+        unique(dat$p3),
+        unique(dat$p4)
+      )
+      
+      rounds<-unique(dat$round)
+      ####
+      sim_dat<-NULL
+      for (r in rounds) { # loop through rounds in roundList
+        d1<-dat%>%filter(round==r)
+        env_nr<-unique(d1$env_number)
+        # simulations for parameter recovery
+        sim_dat_r <- s_policy_shaping_sim(
+          par = estimates,
+          si = d1$social_info,
+          envs = environment_lookup[[env_nr]]
+        ) # only try one sub
+        sim_dat_r$round=r
+        sim_dat_r$player = player_nr
+        sim_dat_r$group = unique(d1$group)
+        sim_dat_r$run<-rptx
+        sim_dat<-rbind(sim_dat,sim_dat_r)
+      }
+      # cv$run = rptx
+      return(sim_dat)
+    }
+  }
+  #
+  #concat simulation runs
+  social_sims<- do.call("rbind", social_sims_plot_d)
+  saveRDS(social_sims,file = here("A_GeneratedFiles","posterior_predictives.rds"))
+}else{
+  social_sims<-readRDS(file = here("A_GeneratedFiles","posterior_predictives.rds"))
+}
+#social_sims$pars_sim[1][[1]]
+```
+
+
+
+```{r}
+#summarize
+social_sims %>% 
+  mutate(uniqueID=player)%>%
+  dplyr::group_by(trial, player, group) %>%
+  filter(trial > 0) %>%
+  dplyr::summarise(m_rew = mean(z))%>%mutate(pats_or_sim="sims")->sims
+
+social_fits %>%filter(!is.na(env_number))%>%mutate(gem=ifelse(env_number>4,1,0),group=group)%>%
+  dplyr::group_by(trial, uniqueID,group,age) %>%
+  filter(trial > 0) %>% #filter(group!="adults")%>%
+  dplyr::summarise(m_rew = mean(points)) %>%mutate(pats_or_sim="pats")->pats
+
+simsub_dat<-rbind(sims,pats)
+
+# make plot comparing learning trajectories of participants with model
+simsub_dat%>%#filter(age>30 | age <17)%>%
+  ggplot(aes(x = trial, y = m_rew,color=group, linetype = pats_or_sim,shape=pats_or_sim)) +
+  stat_summary() +
+  scale_shape_discrete(name= "",labels=c("simulations","participants"))+
+  scale_linetype_manual(name= "Age-group",labels=c("simulations","participants"),values=c("solid","dashed"))+
+  scale_y_continuous(name="Average reward")+
+  scale_x_continuous(name="Trial")+
+  scale_color_brewer(name="Agegroup",palette = "Set2")+
+  guides(linetype=F,shape=F)+
+  facet_wrap(.~pats_or_sim,nrow=1,labeller = labeller(pats_or_sim=c("pats"="Participants","sims"="Model simulations")))+
+  theme_bw(14)+
+  theme(aspect.ratio = 1)-> comp_plot
+
+ggsave(comp_plot,filename=here::here("plots","posterior_predictive_check.png"),width = 7,height = 4)
+```
+
+
+
+
+
+# make plot demonstrating social influece
+the interesting parts:
+1) exploit gem when before there was quite some exploring
+2) exploit non-gem when there is a gem
+
+```{r}
+sis<-list(
+  social_samples=c(12,12,5,7,2,2,2,2,14,14,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11),# exploring first, then gem
+  social_samples_2=c(2,2,2,3,3,3,3,3,63,4,14,17,16,16,9,2,2,2,17,2,43,4,3,43,40)# reasonable at first, then bad
+)
+envs_social<-environment_lookup[[5]]
+
+#parameters to simulate
+parvec_adol<-c(0.5,0.1,0.2,1.5)
+parvec_adul<-c(0.5,0.3,0.1,1.5)
+
+
+#simulate over three types of social information
+adol_sim<-NULL
+adul_sim<-NULL
+
+for (rep in 1:1000){# 100 repetitions
+  for (si in c(1:2)){# two types of social info (one time good, another time bad)
+    adol_sim_1<-s_policy_shaping_sim(
+      par = parvec_adol,
+      envs = envs_social,
+      si=sis[[si]]
+    ) %>%mutate(si=si)
+    
+    adul_sim_1<-s_policy_shaping_sim(
+      par = parvec_adul,#[.x,],
+      envs = envs_social,
+      si=sis[[si]]
+    )%>%mutate(si=si)
+    # concatanete simulations
+    adul_sim<- rbind(adul_sim_1,adul_sim)
+    adol_sim<- rbind(adol_sim_1,adol_sim)
+  }
+}
+
+sims<-rbind(
+  adul_sim%>%mutate(group="adul"),
+  adol_sim%>%mutate(group="adol")
+)
+
+```
+
+```{r}
+copyprob_good_si<-sims%>%filter(si==1)%>%
+  ggplot(aes(x=trial,y=p_copy,color=group))+
+  geom_vline(xintercept = 12,linetype="dotted")+
+  stat_smooth()+
+  scale_color_brewer(name="Agegroup",palette = "Set2")+
+  scale_y_continuous(name="Probability to copy")+
+  scale_x_continuous(name="Trial")+
+  coord_cartesian(ylim=c(0,0.2))+
+  guides(color=F)+
+  theme_bw(14)+
+  theme(aspect.ratio = 1)
+
+copyprob_bad_si<-sims%>%filter(si==2)%>%
+  ggplot(aes(x=trial,y=p_copy,color=group))+
+  geom_vline(xintercept = 4,linetype="dotted")+
+  stat_smooth()+
+  scale_color_brewer(name="Agegroup",palette = "Set2")+
+  scale_y_continuous(name="Probability to copy")+
+  scale_x_continuous(name="Trial")+
+  coord_cartesian(ylim=c(0,0.2))+
+  guides(color=F)+
+  theme_bw(14)+
+  theme(aspect.ratio = 1)
+
+points_good_si<-sims%>%filter(si==1)%>%
+  ggplot(aes(x=trial,y=z,color=group))+
+  geom_vline(xintercept = 12,linetype="dotted")+
+  stat_smooth()+
+  scale_color_brewer(name="Agegroup",palette = "Set2")+
+  scale_y_continuous(name="Average reward")+
+  scale_x_continuous(name="Trial")+
+  guides(color=F)+
+  coord_cartesian(ylim=c(0,200))+
+  theme_bw(14)+
+  theme(aspect.ratio=1)
+
+points_bad_si<-sims%>%filter(si==2)%>%
+  ggplot(aes(x=trial,y=z,color=group))+
+  geom_vline(xintercept = 4,linetype="dotted")+
+  stat_smooth()+
+  scale_color_brewer(name="Agegroup",palette = "Set2")+
+  scale_y_continuous(name="Average reward")+
+  scale_x_continuous(name="Trial")+
+  coord_cartesian(ylim=c(0,200))+
+  guides(color=F)+
+  theme_bw(14)+
+  theme(aspect.ratio=1)
+
+```
+
+```{r fig.width=12,fig.height=5}
+params_sims_plot<-plot_grid(
+  parameters,
+  plot_grid(copyprob_good_si,copyprob_bad_si+scale_y_continuous(name=""),points_good_si,points_bad_si+scale_y_continuous(name=""),nrow=2),
+  rel_widths = c(1.5,1)
+)
+
+ggsave(params_sims_plot,filename=here("plots","params_sims_plot.png"),width = 12,height = 6)
+```
+
+```{r fig.width=10,fig.height=5}
+
+modelling_figure<-plot_grid(parameters,comp_plot,labels=c("A","B"),rel_widths = c(1,0.5))
+
+ggsave("sims_learn_tau.png",plot = comp_plot,width = 5,height = 5)
+
+
+```
+
+# recovery
+
+This here is simulating data based on model fits
+```{r}
+
+cl <- makeCluster(detectCores()-8, type = 'PSOCK')
+registerDoParallel(cl)
+
+social_data_recov_s_w<-list()
+for (i in 1:100){
+  
+  social_data_recov_s_w[[i]]<-foreach(
+    player_nr = unique(social_fits$uniqueID),
+    .packages = c("DEoptim", "dplyr","here"),
+    .combine = "rbind"
+  ) %dopar%{
+    
+    # get data from one player
+    dat <- social_fits %>% filter(
+      uniqueID == player_nr,
+    )
+    
+    #### unpack parameters from model fits
+    estimates<- c(
+      unique(dat$p1),
+      unique(dat$p2),
+      unique(dat$p3),
+      unique(dat$p4)
+    )
+    
+    sim_dat<-NULL
+    for (r in unique(dat$round)) { # loop through rounds in roundList
+      d1<-dat%>%filter(round==r)
+      env_nr<-unique(d1$env_number)
+      # simulations for parameter recovery
+      sim_dat_r <- s_policy_shaping_sim(
+        par = estimates,
+        si = d1$social_info,
+        envs = environment_lookup[[env_nr]]
+      ) # only try one sub
+      sim_dat_r$round=r
+      sim_dat_r$player = player_nr
+      sim_dat_r$group = unique(d1$group)
+      sim_dat_r$env<-env_nr
+      sim_dat<-rbind(sim_dat,sim_dat_r)
+    }
+    
+    return(sim_dat)
+  }
+}
+
+saveRDS(social_data_recov_s_w,file = here("A_GeneratedFiles","recovery_sims.rds"))
+
+
+```
+
+
+#
+
+```{r}
+
+cl <- makeCluster(detectCores()-8, type = 'PSOCK')
+registerDoParallel(cl)
+#container for the parameter recovery analysis
+social_recovery<-list()
+for (i in 1:25){
+  social_data_recov<-social_data_recov_s_w[[i]]
+  social_recovery[[i]] <- foreach(
+    player_nr = unique(social_data_recov$player),
+    .packages = c("DEoptim", "tidyverse","here","data.table"),
+    .combine = "rbind"
+  ) %dopar%{
+    environments <- load_envs_social(path = here("A_GeneratedFiles","environments/"))
+    
+    #for(player_nr in unique(social_data$player)){
+    Xnew <- as.matrix(expand.grid(0:7, 0:7)) # do this outside the loop for better speed
+    # social data TODO: concatenate nonsocial data.
+    #print(s)
+    print(player_nr)
+    d1 <- social_data_recov %>% filter(
+      player == player_nr
+      #soc_info_round == s
+    ) %>%
+      #filter(gempresent == 0) %>%  # for now only have rounds without gems 
+      group_by(round) %>%
+      mutate(z = z, #(points - mean(points)) / sd(points), ventually figure out what is the best outcome for this
+             social_info = social_info,
+             choices = index,
+             env_number=env_idx
+      ) %>%ungroup()
+    #rounds <- unique(d1$round)
+    #only fit if you have 25 klicks.
+    
+    d_recov <- fit_policy(d1 = d1,environments=environments) # only try one sub
+    
+    # collect fit indices
+    
+    d_recov$fit <- unlist(cv[1])
+    #d1$lr_p <- unlist(cv[2])
+    #d1$intercept <- unlist(cv[2])
+    d_recov$lr<-unlist(cv[2])
+    d_recov$tau_1<-unlist(cv[3])
+    d_recov$sw_1<-unlist(cv[4])
+    d_recov$prior<-unlist(cv[5])
+    # d1$lr<-unlist(cv[4])
+    #d1$ut<-unlist(cv[4])
+    # d1$streak_w<-unlist(cv[4])
+    # d1$prior<-unlist(cv[6])
+    # d1$sw <- unlist(cv[4])
+    return(d_recov)
+  }
+}
+saveRDS(social_recovery,file = here("A_GeneratedFiles","recovery_sw3.rds"))
+
+```
+
+```{r}
+sw_recov<-tibble()
+estimates<-foreach(
+  player_nr = unique(social_fits$uniqueID),
+  .packages = c("DEoptim", "dplyr","here"),
+  .combine = "rbind"
+) %do%{
+  
+  # print(rptx)
+  Xnew <-as.matrix(expand.grid(0:7, 0:7)) # do this outside the loop for better speed
+  print(player_nr)
+  
+  # social data TODO: concatenate nonsocial data.
+  d1 <- social_fits %>% filter(
+    uniqueID == player_nr,
+  ) %>%
+    #filter(gempresent == 0) %>%  # for now only have rounds without gems 
+    group_by(round) %>%
+    mutate(z = points, #(points - mean(points)) / sd(points), ventually figure out what is the best outcome for this
+           social_info = social_info,
+           choices = cells,
+           soc_info_round=demo_quality,
+    ) %>%ungroup()
+  #### unpack parameters
+  lr<-unique(d1$lr)
+  tau<-unique(d1$tau_1)
+  sw<-unique(d1$sw_1)
+  prior<-unique(d1$prior) 
+  return(tibble(lr=lr,tau=tau,sw=sw,prior=prior))
+}
+
+recovery=tibble()
+for (i in 1:20){
+  ah<-tibble(
+    fit_sw=social_recovery[[i]]%>%
+      as_tibble()%>%
+      pull(par3)%>%unlist(),
+    fit_lr=social_recovery[[i]]%>%
+      as_tibble()%>%
+      pull(par1)%>%unlist(),
+    fit_tau=social_recovery[[i]]%>%
+      as_tibble()%>%
+      pull(par2)%>%unlist(),
+    sim_sw=estimates$sw,
+    sim_tau=estimates$tau,
+    sim_lr=estimates$lr,
+    idx=i
+  )
+  recovery<- rbind(recovery,ah)
+}
+
+recovery_real<-recovery%>%group_by(sim_sw,sim_tau,sim_lr)%>%
+  summarise(
+    rec_sw=mean(fit_sw),
+    rec_lr=mean(fit_lr),
+    rec_tau=mean(fit_tau)
+  )
+
+cor(recovery_real$rec_sw,recovery_real$sim_sw,method = "spearman")
+
+fit<-social_fits%>%
+  select(fit,p1,p2,p3,p4,uniqueID)%>%
+  unique()%>%
+  mutate(what="original",player=uniqueID)%>%
+  select(-uniqueID)
+
+recovery_list<-list()
+for (i in 1:500){
+  rec<-readRDS(file = paste0("A_GeneratedFiles/tardis_recovery_",i,".rds"))%>%
+    select(fit,p1,p2,p3,p4,player)%>%unique()%>%mutate(what="recovery")
+  
+  recovery_list[[i]]<-rbind(
+    fit,
+    rec
+  )%>%pivot_wider(id_cols = player,names_from = "what",values_from = c(p1,p2,p3,p4))
+  
+}
+
+plotting<-do.call("rbind",recovery_list)
+
+plotting<-plotting%>%group_by(player)%>%
+  summarise(
+    p1_original=mean(p1_original),
+    p2_original=mean(p2_original),
+    p3_original=mean(p3_original),
+    p4_original=mean(p4_original),
+    p1_recovery=mean(p1_recovery),
+    p2_recovery=mean(p2_recovery),
+    p3_recovery=mean(p3_recovery),
+    p4_recovery=mean(p4_recovery)
+  )
+
+```
+
+
+```{r}
+# p1
+omegas<-plot_grid(
+  plotting%>%
+    ggplot(aes(x=p1_original,y=p1_recovery))+
+    geom_point(alpha=0.2,color="red")+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *omega))+
+    scale_y_continuous(name=expression("fitted " *omega))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  plotting%>%
+    ggplot(aes(x=p1_original,y=p2_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *omega))+
+    scale_y_continuous(name=expression("fitted " *tau))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  plotting%>%
+    ggplot(aes(x=p1_original,y=p3_recovery))+
+    geom_point(alpha=0.2)+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *omega))+
+    scale_y_continuous(name=expression("fitted " *tau))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1), 
+  plotting%>%
+    ggplot(aes(x=p1_original,y=p4_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *omega))+
+    scale_y_continuous(name=expression("fitted " *zeta))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  nrow=1
+)
+
+#p2
+taus<-plot_grid(
+  plotting%>%
+    ggplot(aes(x=p2_original,y=p1_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    scale_x_continuous(name=expression("simulated " *tau))+
+    scale_y_continuous(name=expression("fitted " *omega))+  
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    theme_cowplot()+
+    theme(aspect.ratio = 1),  
+  plotting%>%
+    ggplot(aes(x=p2_original,y=p2_recovery))+
+    geom_point(alpha=0.2,color="red")+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *tau))+
+    scale_y_continuous(name=expression("fitted " *tau))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1), 
+  plotting%>%
+    ggplot(aes(x=p2_original,y=p3_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *tau))+
+    scale_y_continuous(name=expression("fitted " *alpha))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  plotting%>%
+    ggplot(aes(x=p2_original,y=p4_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *tau))+
+    scale_y_continuous(name=expression("fitted " *zeta))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  nrow=1
+)
+
+#p3
+alphas<-plot_grid(
+  plotting%>%
+    ggplot(aes(x=p3_original,y=p1_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *alpha))+
+    scale_y_continuous(name=expression("fitted " *omega))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  plotting%>%
+    ggplot(aes(x=p3_original,y=p2_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *alpha))+
+    scale_y_continuous(name=expression("fitted " *tau))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  plotting%>%
+    ggplot(aes(x=p3_original,y=p3_recovery))+
+    geom_point(alpha=0.2,color="red")+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *alpha))+
+    scale_y_continuous(name=expression("fitted " *alpha))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  plotting%>%
+    ggplot(aes(x=p3_original,y=p4_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *alpha))+
+    scale_y_continuous(name=expression("fitted " *zeta))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  nrow=1
+)
+#p4
+
+zetas<-plot_grid(
+  plotting%>%
+    ggplot(aes(x=p4_original,y=p1_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *zeta))+
+    scale_y_continuous(name=expression("fitted " *omega))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  plotting%>%
+    ggplot(aes(x=p4_original,y=p2_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *zeta))+
+    scale_y_continuous(name=expression("fitted " *tau))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  plotting%>%
+    ggplot(aes(x=p4_original,y=p3_recovery))+
+    geom_point(alpha=0.2)+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *zeta))+
+    scale_y_continuous(name=expression("fitted " *alpha))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  plotting%>%
+    ggplot(aes(x=p4_original,y=p4_recovery))+
+    geom_point(alpha=0.2,color="red")+
+    stat_smooth(method="lm",color="black")+
+    ggpubr::stat_cor(aes(label = after_stat(r.label)),method = "pearson",digits=2,cor.coef.name = "rho")+
+    scale_x_continuous(name=expression("simulated " *zeta))+
+    scale_y_continuous(name=expression("fitted " *zeta))+  
+    theme_cowplot()+
+    theme(aspect.ratio = 1),
+  nrow=1
+)
+
+
+
+cormat<-cor(
+  plotting%>%select(p1_original,p2_original,p3_original,p4_original),
+  plotting%>%select(p1_recovery,p2_recovery,p3_recovery,p4_recovery),
+  method="spearman"
+)%>%melt()
+
+recovery_corrmat<-ggplot(data = cormat, aes(x=Var1, y=Var2, fill=value)) + 
+  geom_tile()+
+  scale_y_discrete(name="Fitted parameter",labels=c(expression(omega),expression(tau),expression(alpha),expression(zeta)))+
+  scale_x_discrete(name="Simulation parameter",labels=c(expression(omega),expression(tau),expression(alpha),expression(zeta)))+
+  scale_fill_distiller(name="Correlation",palette = "BrBG",limits=c(-1,1),direction = 1)+
+  geom_text(aes(Var1, Var2, label = round(value,2)), color = "black", size = 4) +
+  theme_bw(14)+
+  theme(aspect.ratio=1,
+        axis.ticks = element_blank())
+
+ggsave(recovery_corrmat,filename=here::here("plots","recovery_correlationmatrix.png"),width = 5,height = 5)
+
+
+```
+
+
+```{r fig.width=15,fig.height=10}
+params_postpred<-cowplot::plot_grid(parameters+theme(aspect.ratio = 1),comp_plot,nrow=1,rel_widths = c(1,0.38))
+
+row_1<-plot_grid(params_postpred,NULL,recovery_corrmat,nrow=1,rel_widths = c(1,0.1,0.7))
+
+ggsave(row_1,filename=here::here("plots","params_sims_recov.png"),width = 15,height = 10)
+```
+
+
+```{r fig.width=9,fig.height=9}
+recovery_plot<-plot_grid(omegas,taus,alphas,zetas,nrow=4)
+
+ggsave(recovery_plot,filename=here::here("plots","recovery.png"),width=9,height=9)
+```
+
+# demon plits
+
+
+
+```{r}
+
+
+dummy<-social_data_recov_s_w%>%filter(env_idx %in% c(5,6))%>%
+  # filter(demo_quality=="worst")%>%
+  #filter(player==2)%>%
+  ggplot(aes(x=trial,y=copy_util,color=as.factor(env_idx)))+
+  geom_point(aes(group=player),alpha=0.3)+
+  scale_color_manual(name="Quality of\n Social Info",labels=c("Good","Bad"),values=c("red","chartreuse3"))+
+  scale_y_continuous(name="Utility of copying [au]")+
+  stat_smooth(size=2)+
+  facet_grid(env_idx ~. ,scales="free")+
+  guides(fill=F)+
+  theme_bw(15)
+
+
+
+Utility<-social_data_recov_s_w%>%filter(env_idx %in% c(5,6))%>%
+  # filter(demo_quality=="worst")%>%
+  #filter(player==2)%>%
+  ggplot(aes(x=trial,y=copy_util,color=as.factor(env_idx)))+
+  #geom_point(aes(group=player),alpha=0.3)+
+  scale_color_manual(name="Quality of\n Social Info",labels=c("Good","Bad"),values=c("red","chartreuse3"))+
+  scale_y_continuous(name="Utility of copying [au]")+
+  stat_smooth(size=2,method = "loess",fill=NA)+
+  facet_grid(env_idx ~. ,scales="free")+
+  guides(fill=F,color=F)+
+  theme_bw(15)+  
+  theme(
+    #aspect.ratio = 1,
+    strip.background = element_blank(),
+    strip.text.y = element_blank()
+  )
+
+
+Value<-social_data_recov_s_w%>%filter(env_idx %in% c(5,6))%>%
+  # filter(demo_quality=="worst")%>%
+  #filter(player==2)%>%
+  ggplot(aes(x=trial,y=copy_prob,color=as.factor(env_idx)))+
+  scale_color_manual(name="Quality of\n Social Info",labels=c("Good","Bad"),values=c("red","chartreuse3"))+
+  scale_y_continuous(name=expression("Copy probability: "* (1+exp(-Q_copy))^ -1))+
+  #stat_summary(size=1,geom="line")+
+  stat_smooth(size=2,method = "loess",fill=NA)+
+  coord_cartesian(ylim=c(0,0.2))+
+  facet_grid(env_idx ~. )+
+  guides(fill=F,color=F)+
+  theme_bw(15)+
+  theme(
+    #aspect.ratio = 1,
+    strip.background = element_blank(),
+    strip.text.y = element_blank()
+  )
+
+legend<-get_legend(dummy)
+model_demo_plot<-plot_grid(Utility,NULL,Value,legend,ncol=4,rel_widths = c(1,0.1,1,0.3))
+
+ggsave(model_demo_plot,filename=here::here("plots","model_dynamics.png"),width = 10,height=4.5)
+```
+
+
+
+
+```{r}
+samples_gem_late<-c(1,1,5,7,2,2,2,2,14,14,16,16,2,2,17,17,17,11,11,11,11,11,11,11,11)
+samples_gem_early<-c(1,1,5,7,2,2,2,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11)
+
+```
+
+
