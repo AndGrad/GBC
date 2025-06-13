@@ -73,6 +73,7 @@ print(doc, target = "tables/regression_table_exploration.docx")
 
 ## load model fit file
 load(file = paste0(here(),'/modelfits/copy_age_advisor_model.RData'))
+load(file = paste0(here(),'/modelfits/copy_age_advisor_model_priors.RData'))
 
 ## extract model parameters
 regression_table_social_learning <- bayestestR::describe_posterior(copy_age_advisor_model, ci = .95, rope_range = c(-.1, .1)) %>% 
@@ -202,6 +203,7 @@ ggsave("figures/prior_post_copy_age_model.png", pp_plot)
 
 ## load model fit object 
 base::load(paste0(here(),'/modelfits/points_age_trial_advisor_model.RData'))
+base::load(paste0(here(),'/modelfits/points_age_trial_advisor_model_priors.RData'))
 
 regression_table_performance <- bayestestR::describe_posterior(points_age_trial_advisor_model, ci = .95, rope_range = c(-.1, .1)) %>% 
   dplyr::select( -c("CI","ROPE_CI", "ROPE_high", "ROPE_low"))

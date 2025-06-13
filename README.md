@@ -1,4 +1,5 @@
-# Live repository for the materials of the article "Adolescents use social information more than adults when searching for hidden rewards"
+# Live repository for the materials of the manuscript "Adolescents use social information more flexibly than adults during exploration
+"
 
 ## Overview of the repository
 
